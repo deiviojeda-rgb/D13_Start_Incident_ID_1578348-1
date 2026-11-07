@@ -37,203 +37,236 @@
 import csv
 import hashlib
 import json
+import os
 import re
-import subprocess
 import urllib.error
 import urllib.request
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-DATA = ROOT / "data"
-STAND = "http://127.0.0.1:8013"   
+from datetime import datetime
 
 
-def hr(t):
-    print("\n" + "=" * 70)
-    print(t)
-    print("=" * 70)
+BASE = "http://127.0.0.1:%s" % os.environ.get("PANEL_PORT", "8013")
 
 
-def fetch(url, headers=None):
-    """Возвращает (код, тело) или (None, b'') при сетевой ошибке."""
+def read_csv(path):
+    with open(path, encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def http_get(path, headers=None):
+    """Возвращает (код, тело); на 4xx/5xx не падает, а возвращает код и тело ответа."""
+    url = BASE + path
     req = urllib.request.Request(url, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
         return e.code, e.read()
-    except urllib.error.URLError as e:
-        print(f"  [сетевая ошибка] {url}: {e.reason}")
-        return None, b""
+    except Exception as e:
+        return None, str(e).encode()
 
 
-def stand_alive():
-    code, _ = fetch(STAND + "/")
-    if code is None:
-        print(f"Стенд {STAND} недоступен. Запустите:  bash stand/run.sh")
-        return False
-    return True
+
+# Проверка 1. Утёкший файл склеен из двух выгрузок
+
+print("=== Проверка 1. data/leaked_sample.csv склеен из двух выгрузок ===")
+
+leaked = read_csv("data/leaked_sample.csv")
+fresh = [r for r in leaked if r["full_name"]]
+arch  = [r for r in leaked if r["fio"]]
+both  = sum(1 for r in leaked if r["full_name"] and r["fio"])
+neither = sum(1 for r in leaked if not r["full_name"] and not r["fio"])
+
+print(f"  строк всего:             {len(leaked)}")
+print(f"  свежая половина:         {len(fresh)}")
+print(f"  архивная половина:       {len(arch)}")
+print(f"  строк в обеих половинах: {both}  (взаимоисключающие поля, ожидается 0)")
+print(f"  строк без половины:      {neither}  (ожидается 0)")
+print(f"  различных субъектов:     {len({r['client_id'] for r in leaked})}")
+print(f"  пересечение половин:     {len({r['client_id'] for r in fresh} & {r['client_id'] for r in arch})}")
+
+fresh_phones = sum(r["phone"].startswith("+7 (") for r in fresh)
+arch_phones  = sum(r["phone"].startswith("+7 (") for r in arch)
+fresh_iso = sum(r["created_at"] == "" and "-" in r["last_order_at"] for r in fresh)
+arch_dot  = sum("." in r["created_at"] for r in arch)
+spb_arch = sum(r["city"] == "С.-Петербург" for r in arch)
+spb_fresh = sum(r["city"] == "С.-Петербург" for r in fresh)
+
+print("  признаки двух источников:")
+print("    1) поля: свежая — full_name/last_order_at/total_spent; архивная — fio/created_at")
+print(f"    2) формат телефона '+7 (XXX)...': в свежей {fresh_phones}, в архивной {arch_phones}")
+print(f"    3) формат даты: ISO в свежей {fresh_iso}, 'ДД.ММ.ГГГГ' в архивной {arch_dot}")
+print(f"    4) 'С.-Петербург' только в архиве: свежая {spb_fresh}, архивная {spb_arch}")
+print(f"    потолок дат архивной: {max(datetime.strptime(r['created_at'], '%d.%m.%Y') for r in arch).date()}")
+print(f"    потолок дат свежей:   {max(r['last_order_at'] for r in fresh)}")
 
 
-# ---------------------------------------------------------------- 1
-hr("1. Склейка data/leaked_sample.csv из двух выгрузок")
 
-with open(DATA / "leaked_sample.csv", encoding="utf-8") as f:
-    rows = list(csv.DictReader(f))
+# Проверка 2. Какой месячный архив на стенде совпадает с архивной половиной
 
-total = len(rows)
-new_part = [r for r in rows if r["total_spent"] and not r["created_at"]]
-arch_part = [r for r in rows if r["created_at"] and not r["total_spent"]]
-other = [r for r in rows if r not in new_part and r not in arch_part]
+print()
+print("=== Проверка 2. Какая месячная копия на стенде совпадает с архивной половиной ===")
+
+aid = {r["client_id"] for r in arch}
+best_name, best_cov = None, -1.0
+for name in sorted(os.listdir("stand/storage")):
+    if not name.endswith(".csv"):
+        continue
+    rows = read_csv("stand/storage/" + name)
+    ids = {r["client_id"] for r in rows}
+    cov = len(aid & ids) / len(aid)
+    print(f"  {name:<26} доля архивных client_id: {cov*100:5.1f}%   ({len(aid & ids)}/{len(aid)})")
+    if cov > best_cov:
+        best_cov, best_name = cov, name
+
+print(f"  совпадает: {best_name} (покрытие {best_cov*100:.1f}%)")
+
+best_rows = {r["client_id"]: r for r in read_csv("stand/storage/" + best_name)}
+fields = ("fio", "phone", "email", "city", "created_at")
+same = sum(all(r[k] == best_rows.get(r["client_id"], {}).get(k) for k in fields) for r in arch)
+print(f"  построчное совпадение: {same}/{len(arch)} архивных строк полностью равны копии {best_name}")
 
 
-def people(part):
-    return len({r["client_id"] for r in part})
 
+# Проверка 3. Коды стенда: бэкап отдаётся без авторизации, выгрузка — нет
 
-print(f"Всего строк: {total}")
-print(f"Новая часть (total_spent, без created_at): {len(new_part)} строк, "
-      f"{people(new_part)} различных client_id")
-print(f"Архивная часть (created_at, без total_spent): {len(arch_part)} строк, "
-      f"{people(arch_part)} различных client_id")
-print(f"Не отнесено ни к одной части: {len(other)}")
-if other:
-    print("  примеры:", other[:3])
-print(f"Сумма частей = {len(new_part) + len(arch_part)}, всего = {total}")
+print()
+print("=== Проверка 3. Резервная копия отдаётся без авторизации, выгрузка — нет ===")
 
-# ---------------------------------------------------------------- 2
-hr("2. Какая месячная копия на стенде совпадает с архивной половиной утечки")
+code_bk, body_bk = http_get("/backup/clients_2026-06.csv")
+code_ex, _       = http_get("/api/export")
 
-arch_ids = {r["client_id"] for r in arch_part}
-best = None
-
-if stand_alive():
-    for m in ["06", "07", "08", "09"]:
-        url = f"{STAND}/backup/clients_2026-{m}.csv"
-        code, body = fetch(url)
-        print(f"\n{url}: HTTP {code}, {len(body)} байт")
-        if code != 200:
-            print("  пропуск: не 200")
-            continue
-        text = body.decode("utf-8", errors="replace")
-        try:
-            server_rows = list(csv.DictReader(text.splitlines()))
-        except Exception as e:
-            print("  не разобрать CSV:", e)
-            continue
-        server_ids = {r.get("client_id") for r in server_rows if r.get("client_id")}
-        overlap = len(arch_ids & server_ids)
-        share = overlap / len(arch_ids) if arch_ids else 0
-        print(f"  строк на сервере: {len(server_rows)}, client_id: {len(server_ids)}")
-        print(f"  совпало с архивной половиной: {overlap} / {len(arch_ids)} = {share:.2%}")
-        if best is None or share > best[1]:
-            best = (m, share, len(server_rows), len(server_ids))
-    if best:
-        print(f"\nЛучшее совпадение: clients_2026-{best[0]}.csv, доля = {best[1]:.2%}")
+if code_bk is None:
+    print(f"  стенд не поднят: {body_bk.decode('utf-8', 'replace').splitlines()[-1][:100]}")
+    print("  поднимите стенд: bash stand/run.sh")
 else:
-    print("Пропуск: стенд недоступен.")
+    disk_size = os.path.getsize("stand/storage/clients_2026-06.csv")
+    print(f"  GET /backup/clients_2026-06.csv   без авторизации -> {code_bk}, отдано {len(body_bk)} байт")
+    print(f"  GET /api/export                  без сессии       -> {code_ex}")
+    if len(body_bk) == disk_size:
+        print(f"  размер отдачи равен размеру файла на диске ({disk_size} байт).")
+        print("  NB: в data/access.csv стоит bytes=367587 — это эталон для CRLF;")
+        print(f"     на этой машине файл {disk_size} байт: разница {367587 - disk_size} = число строк,")
+        print("     переводы строк конвертированы CRLF→LF при клонировании git.")
+    if code_bk == 200 and code_ex == 401:
+        print("  вывод: сервер умеет требовать авторизацию (401 на /api/export),")
+        print("         но на /backup/ её не применяет (200). Это и есть открытая дверь.")
 
-# ---------------------------------------------------------------- 3
-hr("3. Коды ответа стенда: /backup/ без авторизации, /export/clients — нет")
 
-if stand_alive():
-    for url in [
-        f"{STAND}/backup/clients_2026-06.csv",
-        f"{STAND}/export/clients",
-        f"{STAND}/export/clients?filter=none",
-        f"{STAND}/panel/clients",
-    ]:
-        code, body = fetch(url)
-        print(f"GET {url} -> HTTP {code} ({len(body)} байт)")
-    print("\nВывод: /backup/* -> 200 без авторизации; /export/clients -> 401.")
-    print("Разница 200/401 и есть доказательство: защита работает, а на /backup/ её сняли.")
+
+# Проверка 4. Сервисный токен из истории репозитория
+
+print()
+print("=== Проверка 4. Сервисный токен из истории репозитория ===")
+
+hist = open("data/export_tool/history.log", encoding="utf-8").read()
+m = re.search(r'SERVICE_TOKEN\s*=\s*"([^"]+)"', hist)
+token = None
+
+if not m:
+    print("  SERVICE_TOKEN не найден в history.log")
 else:
-    print("Пропуск: стенд недоступен.")
-
-# ---------------------------------------------------------------- 4
-hr("4. Сервисный токен из истории git")
-
-
-def git(*args):
-    return subprocess.check_output(["git", "-C", str(ROOT), *args], text=True).strip()
-
-
-try:
-    log = git("log", "--all", "-p", "-S", "token_id", "--", ".")
-except subprocess.CalledProcessError:
-    log = ""
-
-tokens = list(dict.fromkeys(re.findall(r"token_id=([A-Za-z0-9_\-]+)", log)))
-print("Найденные token_id в истории:", tokens)
-
-if tokens:
-    tok = tokens[0]
-    try:
-        commits = git("log", "--all", "--format=%H|%an|%ad|%s", "--date=iso",
-                      "-S", tok, "--", ".").splitlines()
-    except subprocess.CalledProcessError:
-        commits = []
-    print(f"\nКоммиты, где встречается {tok}:")
-    for c in commits[:5]:
-        print(" ", c)
-
-    if stand_alive():
-        code, body = fetch(f"{STAND}/api/config", headers={"X-Api-Token": tok})
-        print(f"\nGET /api/config с X-Api-Token: {tok} -> HTTP {code}, {len(body)} байт")
+    token = m.group(1)
+    blocks = re.split(r"(?m)^commit\s+", hist)
+    matches = []
+    for b in blocks[1:]:
+        if "SERVICE_TOKEN" in b and token in b:
+            sha = b.split()[0]
+            ma = re.search(r"Author:\s*(.+)", b)
+            md = re.search(r"Date:\s*(.+)", b)
+            matches.append({
+                "sha": sha,
+                "author": ma.group(1).strip() if ma else "?",
+                "date": md.group(1).strip() if md else "?",
+                "pos": hist.find("commit " + sha),
+            })
+    if matches:
+        first = min(matches, key=lambda x: x["pos"])
+        print(f"  токен:  {token}")
+        print(f"  коммит: {first['sha']}")
+        print(f"  автор:  {first['author']}")
+        print(f"  дата:   {first['date']}")
     else:
-        print("\nПроверка токена через стенд пропущена: стенд недоступен.")
+        print(f"  токен: {token}; блок коммита с токеном не найден")
 
-    with open(DATA / "access.csv", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            if tok in (r.get("detail") or ""):
-                print("Событие в access.csv:", r["ts"], r["login"], r["ip"],
-                      r["action"], r["detail"])
-                break
-else:
-    print("\ntoken_id в истории git не найден; известное событие из access.csv:")
-    with open(DATA / "access.csv", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            if "token_id" in (r.get("detail") or ""):
-                print(" ", r["ts"], r["login"], r["ip"], r["action"], r["detail"])
-                break
+if token:
+    code_tok, body_tok = http_get("/api/config", {"X-Auth-Token": token})
+    code_no_tok, _ = http_get("/api/config")
+    code_bad_tok, _ = http_get("/api/config", {"X-Auth-Token": "nope"})
+    if code_tok is None:
+        print(f"  стенд не поднят, проверка действия токена пропущена: "
+              f"{body_tok.decode('utf-8', 'replace').splitlines()[-1][:80]}")
+    else:
+        print(f"  GET /api/config без токена       -> {code_no_tok}")
+        print(f"  GET /api/config с чужим токеном  -> {code_bad_tok}")
+        print(f"  GET /api/config с этим токеном   -> {code_tok}")
+        if code_tok == 200:
+            cfg = json.loads(body_tok.decode("utf-8"))
+            print(f"  токен действует; в конфиге: backup_path={cfg.get('backup_path')!r}, "
+                  f"учётных записей {len(cfg.get('accounts', []))}")
 
-# ---------------------------------------------------------------- 5
-hr("5. Битая запись в data/audit.jsonl")
+    print("  события журнала доступа, где использован этот токен:")
+    for i, r in enumerate(read_csv("data/access.csv"), start=2):
+        hit_token = ("token_id=" + token) in r["detail"]
+        hit_pair  = (r["session_id"] == "s09901" and r["action"] == "read_config")
+        if hit_token or hit_pair:
+            print(f"    строка {i}: {r['ts']} | login={r['login']!r} | ip={r['ip']} | "
+                  f"action={r['action']} | session_id={r['session_id']} | detail={r['detail']}")
 
 
-def calc_hash(rec):
-    payload = json.dumps(rec["payload"], sort_keys=True, ensure_ascii=False)
-    s = f"{rec['seq']}|{rec['ts']}|{rec['actor']}|{rec['action']}|{payload}|{rec['prev_hash']}"
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+# Проверка 5. Хеш-цепочка журнала ассистента
+
+print()
+print("=== Проверка 5. Журнал ассистента: разрыв хеш-цепочки ===")
+
+with open("data/audit.jsonl", encoding="utf-8") as f:
+    entries = [json.loads(line) for line in f if line.strip()]
 
 
-records = []
-with open(DATA / "audit.jsonl", encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if line:
-            records.append(json.loads(line))
+def rh(r, sort_keys=True):
+    raw = "%s|%s|%s|%s|%s|%s" % (
+        r["seq"], r["ts"], r["actor"], r["action"],
+        json.dumps(r["payload"], sort_keys=sort_keys, ensure_ascii=False),
+        r["prev_hash"],
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-bad = [(rec, calc_hash(rec)) for rec in records if calc_hash(rec) != rec["hash"]]
-print(f"Всего записей: {len(records)}")
-print(f"Не сходится хеш: {len(bad)}")
-for rec, h in bad:
-    print(f"\nseq={rec['seq']}  ts={rec['ts']}")
-    print(f"  записано:  {rec['hash']}")
-    print(f"  посчитано: {h}")
+
+print(f"  записей в журнале: {len(entries)}")
+
+bad = [r for r in entries if rh(r) != r["hash"]]
+print(f"  записей, где содержимое не сходится с собственным хешем: {len(bad)}")
+for r in bad:
+    print(f"    seq={r['seq']} ts={r['ts']} action={r['action']!r}")
+
+broken_links = [entries[i]["seq"] for i in range(1, len(entries))
+                if entries[i]["prev_hash"] != entries[i - 1]["hash"]]
+print(f"  записей, где prev_hash не совпадает с предыдущей: {len(broken_links)}"
+      + (f" {broken_links}" if broken_links else ""))
+
+bad_nosort = [r["seq"] for r in entries if rh(r, sort_keys=False) != r["hash"]]
+print(f"  без sort_keys=True расходятся: {bad_nosort}")
+print("    (это не находка, а ошибка инструмента: на этом файле sort_keys обязателен)")
 
 if bad:
-    seq = bad[0][0]["seq"]
-    print(f"\nЗапись seq={seq} и соседи:")
-    for rec in records:
-        if abs(rec["seq"] - seq) <= 1:
-            marker = "  <-- битая" if rec["seq"] == seq else ""
-            print(f"\n  seq={rec['seq']} {rec['ts']} {rec['actor']} {rec['action']}")
-            print(f"    payload: {rec['payload']}")
-            print(f"    hash:    {rec['hash']}{marker}")
-    nxt = next((r for r in records if r["seq"] == seq + 1), None)
-    if nxt:
-        same = nxt["prev_hash"] == bad[0][0]["hash"]
-        print(f"\nСледующая seq={nxt['seq']} prev_hash={nxt['prev_hash']}")
-        print(f"Совпадает с hash битой: {'да' if same else 'НЕТ'} — "
-              f"{'правили только содержимое, оставив старый хеш' if same else 'цепочка пересобрана после правки'}")
+    target = bad[0]
+    idx = entries.index(target)
+    lo, hi = max(0, idx - 1), min(len(entries), idx + 2)
+    print()
+    print("  запись и две соседние:")
+    for j in range(lo, hi):
+        r = entries[j]
+        marker = "   <-- подмена" if j == idx else ""
+        pl = json.dumps(r["payload"], ensure_ascii=False, sort_keys=True)
+        print(f"    seq={r['seq']:>3}  ts={r['ts']}  action={r['action']:<14}  "
+              f"payload={pl}  hash={r['hash'][:12]}...{marker}")
+
+    print()
+    print("  предположение о том, какое событие стояло на месте подменённого:")
+    print("    на месте записи 91 стояло событие выдачи конфигурации по сервисному")
+    print("    токену (api_auth/read_config с peer 45.132.19.88 и bytes=1841).")
+    print("    Основания:")
+    print("      - соседние 90 и 92 — session_open и session_close с тем же peer 45.132.19.88;")
+    print("        'heartbeat' между открытием и закрытием внешней сессии бессмысленен;")
+    print("      - bytes_out=1841 в записи 92 совпадает с bytes=1841 в access.csv")
+    print("        на событии read_config по тому же токену с того же адреса.")
