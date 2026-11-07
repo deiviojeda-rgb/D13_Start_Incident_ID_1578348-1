@@ -26,7 +26,7 @@ ts,login,ip,action,object,result,auth_method,session_id,detail
 03.08.2026 07:07:54,s.raifa,10.8.14.21,view_client,ord-49971,ok,session,s01002,
 2026-08-03 07:10:54,s.raifa,10.8.14.21,add_note,ord-47571,ok,session,s01002,
 2026-08-03 07:20:07,m.zueva,77.88.21.141,logout,panel,ok,session,s01003,
-2026-08-03 08:18:54,a.sokolov,109.252.44.19,logout,panel,ok,session,s01004,
+2026-08-03 08:18:54,a.sokolov,109.252.44.19,logout,2026-09-11,ok,session,s01004,
 2026-08-03 08:28:54,s.raifa,10.8.14.21,logout,panel,ok,session,s01002,
 2026-08-03 08:33:07,d.kravets,77.88.21.140,logout,panel,ok,session,s01001,
 2026-08-03 22:15:00,watcher,10.9.2.10,backup_write,/backup/clients_2026-08.csv,ok,service,svc-backup,
